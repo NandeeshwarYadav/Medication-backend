@@ -1,16 +1,17 @@
-// server.js
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const Database = require('better-sqlite3');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const dayjs = require('dayjs');
+const path = require('path');
 
 const app = express();
 const PORT = 3001;
 const SECRET_KEY = 'your_secret_key';
-
+const dbPath = path.join(__dirname, 'medication_app.db');
+const db = new Database(dbPath);
 
 app.use(cors());
 app.use(bodyParser.json());
@@ -20,31 +21,27 @@ app.use((req, res, next) => {
   next();
 });
 
-const db = new sqlite3.Database('./medication_app.db', (err) => {
-  if (err) return console.error(err.message);
-  console.log('Connected to SQLite database.');
-});
+// Initialize tables
+db.exec(`
+  PRAGMA foreign_keys = ON;
 
-db.serialize(() => {
-  db.run(`PRAGMA foreign_keys = ON`);
-
-  db.run(`CREATE TABLE IF NOT EXISTS users (
+  CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT,
     email TEXT UNIQUE,
     password TEXT,
     phone TEXT,
     role TEXT CHECK(role IN ('patient', 'caretaker'))
-  )`);
+  );
 
-  db.run(`CREATE TABLE IF NOT EXISTS assignments (
+  CREATE TABLE IF NOT EXISTS assignments (
     patient_id INTEGER UNIQUE,
     caretaker_id INTEGER UNIQUE,
     FOREIGN KEY(patient_id) REFERENCES users(id),
     FOREIGN KEY(caretaker_id) REFERENCES users(id)
-  )`);
+  );
 
-  db.run(`CREATE TABLE IF NOT EXISTS medications (
+  CREATE TABLE IF NOT EXISTS medications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     patient_id INTEGER,
     name TEXT,
@@ -52,17 +49,17 @@ db.serialize(() => {
     frequency TEXT,
     UNIQUE(patient_id, name),
     FOREIGN KEY(patient_id) REFERENCES users(id)
-  )`);
+  );
 
-  db.run(`CREATE TABLE IF NOT EXISTS medication_logs (
+  CREATE TABLE IF NOT EXISTS medication_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     patient_id INTEGER,
     date TEXT,
     status TEXT,
     UNIQUE(patient_id, date),
     FOREIGN KEY(patient_id) REFERENCES users(id)
-  )`);
-});
+  );
+`);
 
 function authenticate(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -78,304 +75,214 @@ function authenticate(req, res, next) {
 
 function fillMissedLogsForPast30Days(patientId) {
   const today = dayjs();
-  const dates = [];
   for (let i = 1; i < 30; i++) {
-    dates.push(today.subtract(i, 'day').format('YYYY-MM-DD'));
+    const date = today.subtract(i, 'day').format('YYYY-MM-DD');
+    const row = db.prepare(`SELECT 1 FROM medication_logs WHERE patient_id = ? AND date = ?`).get(patientId, date);
+    if (!row) {
+      db.prepare(`INSERT INTO medication_logs (patient_id, date, status) VALUES (?, ?, 'missed')`).run(patientId, date);
+    }
   }
-
-  dates.forEach(date => {
-    db.get(`SELECT 1 FROM medication_logs WHERE patient_id = ? AND date = ?`, [patientId, date], (err, row) => {
-      if (err) return;
-      if (!row) {
-        db.run(`INSERT INTO medication_logs (patient_id, date, status) VALUES (?, ?, 'missed')`, [patientId, date]);
-      }
-    });
-  });
 }
 
+// Signup
 app.post('/signup', async (req, res) => {
   try {
     const { name, email, password, phone, role } = req.body;
-    if (!name || !email || !password || !phone || !role)
+    if (!name || !email || !password || !phone || !role) {
       return res.status(400).json({ error: 'Missing fields' });
+    }
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
     if (role === 'patient') {
-      db.get(
-        `SELECT id FROM users WHERE role = 'caretaker' AND id NOT IN (SELECT caretaker_id FROM assignments) LIMIT 1`,
-        [],
-        (err, row) => {
-          if (err) return res.status(500).json({ error: 'Database error' });
-          if (!row) return res.status(400).json({ error: 'No available caretakers' });
+      const caretaker = db.prepare(`
+        SELECT id FROM users WHERE role = 'caretaker' AND id NOT IN 
+        (SELECT caretaker_id FROM assignments) LIMIT 1
+      `).get();
 
-          db.run(
-            `INSERT INTO users (name, email, password, phone, role) VALUES (?, ?, ?, ?, ?)`,
-            [name, email, hashedPassword, phone, role],
-            function (err) {
-              if (err)
-                return res.status(400).json({ error: 'User already exists or invalid data' });
+      if (!caretaker) return res.status(400).json({ error: 'No available caretakers' });
 
-              const userId = this.lastID;
+      const insert = db.prepare(`
+        INSERT INTO users (name, email, password, phone, role)
+        VALUES (?, ?, ?, ?, ?)
+      `);
 
-              db.run(
-                `INSERT INTO assignments (patient_id, caretaker_id) VALUES (?, ?)`,
-                [userId, row.id],
-                err => {
-                  if (err)
-                    return res.status(500).json({ error: 'Assignment failed after registration' });
+      const info = insert.run(name, email, hashedPassword, phone, role);
+      const userId = info.lastInsertRowid;
 
-                  res.status(201).json({
-                    message: 'Patient registered and assigned to caretaker',
-                  });
-                }
-              );
-            }
-          );
-        }
-      );
+      db.prepare(`
+        INSERT INTO assignments (patient_id, caretaker_id)
+        VALUES (?, ?)
+      `).run(userId, caretaker.id);
+
+      return res.status(201).json({ message: 'Patient registered and assigned to caretaker' });
+
     } else {
-      db.run(
-        `INSERT INTO users (name, email, password, phone, role) VALUES (?, ?, ?, ?, ?)`,
-        [name, email, hashedPassword, phone, role],
-        function (err) {
-          if (err)
-            return res.status(400).json({ error: 'User already exists or invalid data' });
+      db.prepare(`
+        INSERT INTO users (name, email, password, phone, role)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(name, email, hashedPassword, phone, role);
 
-          res.status(201).json({ message: 'Caretaker registered' });
-        }
-      );
+      return res.status(201).json({ message: 'Caretaker registered' });
     }
   } catch (err) {
-    res.status(500).json({ error: 'Internal Server Error' });
+    console.error(err);
+    return res.status(400).json({ error: 'User already exists or invalid data' });
   }
 });
 
-
+// Login
 app.post('/login', async (req, res) => {
   try {
     const { email, password, role } = req.body;
+    if (!email || !password || !role) return res.status(400).json({ error: 'Missing fields' });
 
-    if (!email || !password || !role) {
-      return res.status(400).json({ error: 'Missing fields' });
+    const user = db.prepare(`SELECT * FROM users WHERE email = ? AND role = ?`).get(email, role);
+    if (!user) return res.status(401).json({ error: 'User not found' });
+
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+
+    if (role === 'caretaker') {
+      const assignment = db.prepare(`SELECT * FROM assignments WHERE caretaker_id = ?`).get(user.id);
+      if (!assignment) return res.status(403).json({ error: 'No patient assigned to this caretaker' });
     }
 
-    db.get(`SELECT * FROM users WHERE email = ? AND role = ?`, [email, role], async (err, user) => {
-      if (err || !user) {
-        return res.status(401).json({ error: 'User Not Found' });
-      }
+    const token = jwt.sign({ userId: user.id, role: user.role }, SECRET_KEY, { expiresIn: '2h' });
+    res.json({ token, userId: user.id, role: user.role });
 
-      const valid = await bcrypt.compare(password, user.password);
-      if (!valid) {
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
-
-      const payload = { userId: user.id, role: user.role };
-      const token = jwt.sign(payload, SECRET_KEY, { expiresIn: '2h' });
-
-      // Extra check only for caretakers
-      if (role === 'caretaker') {
-        db.get(`SELECT * FROM assignments WHERE caretaker_id = ?`, [user.id], (err, assignment) => {
-          if (err || !assignment) {
-            return res.status(403).json({ error: 'No patient assigned to this caretaker' });
-          }
-
-          // Success response
-          res.json({ token, userId: user.id, role: user.role });
-        });
-      } else {
-        // Success response for patient
-        res.json({ token, userId: user.id, role: user.role });
-      }
-    });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
-
+// Add medication
 app.post('/medications', authenticate, (req, res) => {
-  try {
-    if (req.user.role !== 'patient') {
-      return res.status(403).json({ error: 'Only patients can add medications' });
-    }
+  if (req.user.role !== 'patient') return res.status(403).json({ error: 'Only patients can add medications' });
 
-    const { name, dosage, frequency } = req.body;
-    if (!name || !dosage || !frequency) {
-      return res.status(400).json({ error: 'Missing fields' });
-    }
+  const { name, dosage, frequency } = req.body;
+  if (!name || !dosage || !frequency) return res.status(400).json({ error: 'Missing fields' });
 
-    // Case-insensitive check for existing medication
-    db.get(`
-      SELECT * FROM medications 
-      WHERE patient_id = ? AND LOWER(name) = LOWER(?)
-    `, [req.user.userId, name], (err, existingMed) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      if (existingMed) {
-        return res.status(400).json({ error: 'Medication already exists' });
-      }
+  const exists = db.prepare(`
+    SELECT 1 FROM medications WHERE patient_id = ? AND LOWER(name) = LOWER(?)
+  `).get(req.user.userId, name);
 
-      // If not found, insert
-      db.run(`
-        INSERT INTO medications (patient_id, name, dosage, frequency) 
-        VALUES (?, ?, ?, ?)`,
-        [req.user.userId, name, dosage, frequency],
-        function (err) {
-          if (err) return res.status(400).json({ error: 'Failed to add medication' });
-          res.status(201).json({ message: 'Medication added' });
-        }
-      );
-    });
-  } catch (err) {
-    res.status(500).json({ error: 'Internal Server Error' });
-  }
+  if (exists) return res.status(400).json({ error: 'Medication already exists' });
+
+  db.prepare(`
+    INSERT INTO medications (patient_id, name, dosage, frequency)
+    VALUES (?, ?, ?, ?)
+  `).run(req.user.userId, name, dosage, frequency);
+
+  res.status(201).json({ message: 'Medication added' });
 });
 
-
+// Mark medication
 app.post('/medications/mark', authenticate, (req, res) => {
-  try {
-    if (req.user.role !== 'patient') return res.status(403).json({ error: 'Only patients can mark medication' });
+  if (req.user.role !== 'patient') return res.status(403).json({ error: 'Only patients can mark medication' });
 
-    const today = new Date().toISOString().split('T')[0];
-    db.run(`INSERT OR REPLACE INTO medication_logs (patient_id, date, status) VALUES (?, ?, 'taken')`,
-      [req.user.userId, today], (err) => {
-        if (err) return res.status(500).json({ error: 'Failed to mark medication' });
-        res.json({ message: 'Medication marked as taken for today' });
-      });
-  } catch (err) {
-    res.status(500).json({ error: 'Internal Server Error' });
-  }
+  const today = dayjs().format('YYYY-MM-DD');
+  db.prepare(`
+    INSERT OR REPLACE INTO medication_logs (patient_id, date, status)
+    VALUES (?, ?, 'taken')
+  `).run(req.user.userId, today);
+
+  res.json({ message: 'Medication marked as taken for today' });
 });
 
+// Patient Dashboard
 app.get('/dashboard/patient', authenticate, (req, res) => {
-  try {
-    if (req.user.role !== 'patient') return res.status(403).json({ error: 'Access denied' });
-    const patientId = req.user.userId;
+  if (req.user.role !== 'patient') return res.status(403).json({ error: 'Access denied' });
 
-    fillMissedLogsForPast30Days(patientId);
+  const patientId = req.user.userId;
+  fillMissedLogsForPast30Days(patientId);
 
-    db.get(`
-      SELECT name FROM users WHERE id = ?
-    `, [patientId], (err, patientRow) => {
-      if (err || !patientRow) return res.status(404).json({ error: 'Patient not found' });
+  const patient = db.prepare(`SELECT name FROM users WHERE id = ?`).get(patientId);
+  const assignment = db.prepare(`
+    SELECT users.name as caretakerName FROM users
+    JOIN assignments ON users.id = assignments.caretaker_id
+    WHERE assignments.patient_id = ?
+  `).get(patientId);
 
-      const patientName = patientRow.name;
+  const logs = db.prepare(`
+    SELECT date, status FROM medication_logs
+    WHERE patient_id = ? AND date >= DATE('now', '-30 day')
+    ORDER BY date
+  `).all(patientId);
 
-      db.get(`
-        SELECT users.name as caretakerName FROM users
-        JOIN assignments ON users.id = assignments.caretaker_id
-        WHERE assignments.patient_id = ?
-      `, [patientId], (err, assignmentRow) => {
-        if (err || !assignmentRow) return res.status(404).json({ error: 'Caretaker not found' });
+  const medications = db.prepare(`
+    SELECT name, dosage, frequency FROM medications WHERE patient_id = ?
+  `).all(patientId);
 
-        db.all(`
-          SELECT date, status FROM medication_logs 
-          WHERE patient_id = ? AND date >= DATE('now', '-30 day') 
-          ORDER BY date
-        `, [patientId], (err, logs) => {
-          if (err) return res.status(500).json({ error: 'Failed to fetch logs' });
-
-          const takenCount = logs.filter(log => log.status === 'taken').length;
-          const adherenceRate = logs.length ? ((takenCount / logs.length) * 100).toFixed(1) : '0.0';
-
-          let streak = 0;
-          for (let i = logs.length - 1; i >= 0; i--) {
-            if (logs[i].status === 'taken') streak++;
-            else break;
-          }
-
-          const today = new Date().toISOString().split('T')[0];
-          const todayLog = logs.find(log => log.date === today);
-          const todayStatus = todayLog ? todayLog.status : 'not marked';
-
-          db.all(`
-            SELECT name, dosage, frequency FROM medications WHERE patient_id = ?
-          `, [patientId], (err, medications) => {
-            if (err) return res.status(500).json({ error: 'Failed to fetch medications' });
-
-            res.json({
-              patientName,
-              caretakerName: assignmentRow.caretakerName,
-              adherenceRate,
-              streak,
-              todayStatus,
-              logs,
-              medications
-            });
-          });
-        });
-      });
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Internal Server Error' });
+  const takenCount = logs.filter(l => l.status === 'taken').length;
+  const adherenceRate = logs.length ? ((takenCount / logs.length) * 100).toFixed(1) : '0.0';
+  let streak = 0;
+  for (let i = logs.length - 1; i >= 0; i--) {
+    if (logs[i].status === 'taken') streak++;
+    else break;
   }
+
+  const today = dayjs().format('YYYY-MM-DD');
+  const todayLog = logs.find(l => l.date === today);
+  const todayStatus = todayLog ? todayLog.status : 'not marked';
+
+  res.json({
+    patientName: patient.name,
+    caretakerName: assignment?.caretakerName || 'Not assigned',
+    adherenceRate,
+    streak,
+    todayStatus,
+    logs,
+    medications
+  });
 });
 
-
+// Caretaker Dashboard
 app.get('/dashboard/caretaker', authenticate, (req, res) => {
-  try {
-    if (req.user.role !== 'caretaker') return res.status(403).json({ error: 'Access denied' });
-    const caretakerId = req.user.userId;
+  if (req.user.role !== 'caretaker') return res.status(403).json({ error: 'Access denied' });
 
-    db.get(`SELECT patient_id FROM assignments WHERE caretaker_id = ?`, [caretakerId], (err, assignment) => {
-      if (err || !assignment) return res.status(404).json({ error: 'No assigned patient found' });
+  const caretakerId = req.user.userId;
+  const assignment = db.prepare(`SELECT patient_id FROM assignments WHERE caretaker_id = ?`).get(caretakerId);
+  if (!assignment) return res.status(404).json({ error: 'No assigned patient found' });
 
-      const patientId = assignment.patient_id;
+  const patientId = assignment.patient_id;
+  fillMissedLogsForPast30Days(patientId);
 
-      fillMissedLogsForPast30Days(patientId);
+  const patient = db.prepare(`SELECT name FROM users WHERE id = ?`).get(patientId);
+  const caretaker = db.prepare(`SELECT name FROM users WHERE id = ?`).get(caretakerId);
 
-      db.get(`SELECT name FROM users WHERE id = ?`, [patientId], (err, patientRow) => {
-        if (err || !patientRow) return res.status(404).json({ error: 'Patient not found' });
+  const logs = db.prepare(`
+    SELECT date, status FROM medication_logs
+    WHERE patient_id = ? AND date >= DATE('now', '-30 day')
+    ORDER BY date
+  `).all(patientId);
 
-        db.get(`SELECT name FROM users WHERE id = ?`, [caretakerId], (err, caretakerRow) => {
-          if (err || !caretakerRow) return res.status(404).json({ error: 'Caretaker not found' });
-
-          const caretakerName = caretakerRow.name;
-
-          db.all(`
-            SELECT date, status FROM medication_logs 
-            WHERE patient_id = ? AND date >= DATE('now', '-30 day') 
-            ORDER BY date
-          `, [patientId], (err, logs) => {
-            if (err) return res.status(500).json({ error: 'Failed to fetch logs' });
-
-            const takenCount = logs.filter(log => log.status === 'taken').length;
-            const adherenceRate = logs.length ? ((takenCount / logs.length) * 100).toFixed(1) : '0.0';
-
-            let streak = 0;
-            for (let i = logs.length - 1; i >= 0; i--) {
-              if (logs[i].status === 'taken') streak++;
-              else break;
-            }
-
-            const today = new Date().toISOString().split('T')[0];
-            const todayLog = logs.find(log => log.date === today);
-            const todayStatus = todayLog ? todayLog.status : 'not marked';
-
-            const takenInWeek = logs.slice(-7).filter(log => log.status === 'taken').length;
-            const missedInMonth = logs.filter(log => log.status !== 'taken').length;
-
-            res.json({
-              caretakerName,
-              patient: patientRow.name,
-              adherenceRate,
-              streak,
-              takenInWeek,
-              missedInMonth,
-              todayStatus,
-              logs
-            });
-          });
-        });
-      });
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'Internal Server Error' });
+  const takenCount = logs.filter(l => l.status === 'taken').length;
+  const adherenceRate = logs.length ? ((takenCount / logs.length) * 100).toFixed(1) : '0.0';
+  let streak = 0;
+  for (let i = logs.length - 1; i >= 0; i--) {
+    if (logs[i].status === 'taken') streak++;
+    else break;
   }
-});
 
+  const today = dayjs().format('YYYY-MM-DD');
+  const todayLog = logs.find(l => l.date === today);
+  const todayStatus = todayLog ? todayLog.status : 'not marked';
+  const takenInWeek = logs.slice(-7).filter(l => l.status === 'taken').length;
+  const missedInMonth = logs.filter(l => l.status !== 'taken').length;
+
+  res.json({
+    caretakerName: caretaker.name,
+    patient: patient.name,
+    adherenceRate,
+    streak,
+    takenInWeek,
+    missedInMonth,
+    todayStatus,
+    logs
+  });
+});
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
